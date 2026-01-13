@@ -7,7 +7,7 @@ Represents factors matrix for QR for banded+semiseparable. we have
     A[1:j,:] == F[1:j,:];
     A[:,1:j] == F[:,1:j];
     A[k, k] == F[k, k] for k < j;
-    A[j+1:end,j+1:end] == A₀[j+1:end,j+1:end] + U[j+1:end,:]*Q*S[j+1:end,1:p]' + U[j+1:end,:]*K*U[j+1:end]'*A₀[j+1:end,j+1:end]
+    A[j+1:end,j+1:end] == A₀[j+1:end,j+1:end] + U[j+1:end,:]*Q*S[j+1:end,1:p]' + U[j+1:end,:]*K*U[j+1:end,:]'*A₀[j+1:end,j+1:end]
                           + U[j+1:end,:]*[Eₛ 0] + [Xₛ;0]*S[j+1:end,1:p]' + [Yₛ;0]*U[j+1:end]'*A₀[j+1:end,j+1:end] + [Zₛ 0;0 0]
 """
 
@@ -149,6 +149,165 @@ function onestep_qr!(A, τ, UᵀU, ūw̄_sum, d_extra, Q_prev, K_prev, Eₛ_pre
 
     A.j[] += 1
 
+end
+
+# computation of qr when the original matrix is symmetric BPS
+
+"""
+Data structure for computing RQ when A is symmetric BPS. 
+
+    For j = 0, we have R₀ = triu(B) + triu(WS',1);  
+    Call the original U as U₀ It requires that S[1:r,:] = U₀ (as a result of A being symmetric) and precompute U = RU₀.
+    As j increases,  for SymmetricBPSPerturbedRQ R:
+    QR[i,i+1:n] = QR[i+1:n,i] = R[i+1:n,i] == B[i+1:n,i] + U[i+1:n,:]*V[i,:]',
+    and QR[i, i] == R[i, i] for i = 1,...,j.
+    R[j+1:end,j+1:end] == R₀[j+1:end,j+1:end] + R₀[j+1:end,j+1:end]*U[j+1:end,:]*Ω*U[j+1:end,:]'
+                          + [Φₛ;0]*U[j+1:end,:]' + R₀[j+1:end,j+1:end]*U[j+1:end]*[Ψₛ 0] + [Λₛ 0;0 0]
+    
+    The information for Household transformations (Q) is stored in U₀, V,  and tril(B) the same way as in BandedPlusSemiseparableQRPerturbedFactors.
+"""
+
+struct SymmetricBPSPerturbedRQ{T} <: LayoutMatrix{T}
+    B::BandedMatrix{T, Matrix{T}, Base.OneTo{Int}} # lower bandwidth l and upper bandwidth l+m
+    U::Matrix{T} # n × r
+    V::Matrix{T} # n × r
+    W::Matrix{T} # n × (p+r)
+    S::Matrix{T} # n × (p+r)
+
+    Ω::Matrix{T} # r × r
+    Φₛ::Matrix{T} # min(l,n) × r
+    Ψₛ::Matrix{T} # r × min(l,n)
+    Λₛ::Matrix{T} # min(l,n) × min(l,n)
+
+    j::Base.RefValue{Int} # how many columns have been determined 
+end
+
+BandedPlusSemiseparableMatrix(R::SymmetricBPSPerturbedRQ) = BandedPlusSemiseparableMatrix(R.B, (R.U, R.V), (R.W, R.S))
+SymmetricBPSPerturbedRQ(R::BandedPlusSemiseparableMatrix) = SymmetricBPSPerturbedRQ(copy(R.B), (copy(R.U), copy(R.V)), (copy(R.W), copy(R.S)))
+
+size(R::SymmetricBPSPerturbedRQ) = size(R.B)
+
+function SymmetricBPSPerturbedRQ(B, (U,V), (W,S))
+    if size(U,1) == size(V,1) == size(W,1) == size(S,1) == size(B,1) == size(B,2) && size(U,2) == size(V,2) && size(W,2) == size(S,2)
+        n, r = size(U)
+        p = size(W,2)
+        l, m = bandwidths(B)
+        
+        if p <= r
+            throw(DimensionMismatch("The second dimension of S should be larger than that of U."))
+        end
+
+        if U != view(S, :, 1:r)
+            throw(ErrorException("The first r column of S should be equal to U"))
+        end
+
+        if m < l
+            throw(ErrorException("The upper bandwidth of B should be no less than the lower bandwidth"))
+        end
+        R = Matrix(triu(B) + triu(W*S',1))
+        # to be modified
+        U_new = R*U
+        SymmetricBPSPerturbedRQ(B,U_new,V,W,S,zeros(r,r),zeros(min(l,n),r),zeros(r,min(l,n)),zeros(min(l,n),min(l,n)),Ref(0))
+    else
+        throw(DimensionMismatch("Dimensions are not compatible."))
+    end
+end
+
+function getindex(R::SymmetricBPSPerturbedRQ, k::Integer, i::Integer)
+    j = R.j[]
+    r = size(R.U, 2)
+    p = size(R.W, 2) - size(R.U, 2)
+    l, m = bandwidths(R.B)
+    m = m - l 
+
+    if k > j && i > j
+        RU = fast_RU(R.U, R.W, R.S, R.B, j+1)
+        if k > i
+            if k <= j + l
+                #(RU[k-j,:])' * R.Ω * R.S[i,1:r] + (R.Φₛ[k-j,:])' * R.S[i,1:r] + (RU[k-j,:])' * R.Ψₛ[:,i-j] + R.Λₛ[k-j,i-j]
+                view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r) + view(R.Φₛ, k-j, :)' * view(R.S, i, 1:r) + view(RU, k-j, :)' * view(R.Ψₛ, :, i-j) + R.Λₛ[k-j,i-j]
+            else
+                if i <= j + l
+                    #(RU[k-j,:])' * R.Ω * R.S[i,1:r] + (RU[k-j,:])' * R.Ψₛ[:,i-j]
+                    view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r) + view(RU, k-j, :)' * view(R.Ψₛ, :, i-j)
+                else
+                    #(RU[k-j,:])' * R.Ω * R.S[i,1:r]
+                    view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r)
+                end
+            end
+        elseif k < i
+            if k <= j + l
+                if i <= j + l
+                    #R.B[k,i] + R.W[k,:]' * R.S[i,:] + (RU[k-j,:])' * R.Ω * R.S[i,1:r] + (R.Φₛ[k-j,:])' * R.S[i,1:r] + (RU[k-j,:])' * R.Ψₛ[:,i-j] + R.Λₛ[k-j,i-j]
+                    R.B[k,i] + view(R.W, k, :)' * view(R.S, i, :) + view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r) + view(R.Φₛ, k-j, :)' * view(R.S, i, 1:r) + view(RU, k-j, :)' * view(R.Ψₛ, :, i-j) + R.Λₛ[k-j,i-j]
+                else
+                    #R.B[k,i] + R.W[k,:]' * R.S[i,:] + (RU[k-j,:])' * R.Ω * R.S[i,1:r] + (R.Φₛ[k-j,:])' * R.S[i,1:r]
+                    R.B[k,i] + view(R.W, k, :)' * view(R.S, i, :) + view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r) + view(R.Φₛ, k-j, :)' * view(R.S, i, 1:r)
+                end
+            else
+                #R.B[k,i] + R.W[k,:]' * R.S[i,:] + (RU[k-j,:])' * R.Ω * R.S[i,1:r]
+                R.B[k,i] + view(R.W, k, :)' * view(R.S, i, :) + view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r)
+            end
+        else
+            if k <= j + l
+                #R.B[k,i] + (RU[k-j,:])' * R.Ω * R.S[i,1:r] + (R.Φₛ[k-j,:])' * R.S[i,1:r] + (RU[k-j,:])' * R.Ψₛ[:,i-j] + R.Λₛ[k-j,i-j]
+                R.B[k,i] + view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r) + view(R.Φₛ, k-j, :)' * view(R.S, i, 1:r) + view(RU, k-j, :)' * view(R.Ψₛ, :, i-j) + R.Λₛ[k-j,i-j]
+            else
+                #R.B[k,i] + (RU[k-j,:])' * R.Ω * R.S[i,1:r]
+                R.B[k,i] + view(RU, k-j, :)' * R.Ω * view(R.S, i, 1:r)
+            end
+        end
+    else
+        if k > i
+            #R.U[k,:]' * R.V[i,:] + R.B[k,i]
+            view(R.U, k, :)' * view(R.V, i, :) + R.B[k,i]
+        elseif k < i
+            #R.U[i,:]' * R.V[k,:] + R.B[i,k]
+            view(R.U, i, :)' * view(R.V, k, :) + R.B[i,k]
+        else
+            R.B[k,i]
+        end
+    end
+end
+
+function rq_mul!(R::SymmetricBPSPerturbedRQ{T}, τ::Vector{T}) where T
+    if R.j[] != 0
+        throw(ErrorException("RQ has already been partially computed"))
+    end
+    
+    n = size(R, 1)
+    for i in 1 : n-1
+        onestep_rq!(R, τ, UᵀU_lookup_table_rq(R), r⁽¹⁾ᵀU⁽²⁾_lookup_table(R))
+    end
+
+    R.B[n,n] = R[n,n] 
+    R.j[] += 1
+end
+
+# Here R should be the factor matrix after the QR decomposition to a symmetric BPS matrix.
+function rq_mul(R::BandedPlusSemiseparableMatrix, τ::Vector{T}) where T
+    RR = SymmetricBPSPerturbedRQ(R)
+    rq_mul!(RR, τ)
+    symmetrize_from_lower!(RR.B)
+    BandedPlusSemiseparableMatrix(RR.B, (RR.U, RR.V), (RR.V, RR.U))
+end
+
+
+function onestep_rq!(R, τ, UᵀU, r⁽¹⁾ᵀU⁽²⁾_table)
+    j = R.j[]
+    n = size(R, 1)
+    l, m = bandwidths(R.B)
+    b = R.B[j+2:min(l+j+1, n), j+1]
+    k̄ = R.V[j+1,:]
+    τ_current = τ[R.j[]+1]
+
+    γ = compute_γ(R, b)
+    δ₁, δ₂, δ₃, δ₄ = compute_variables_δ(R, k̄, b, UᵀU)
+
+    update_lower_triangular_part_rq!(R, τ_current, k̄, b, γ, δ₁, δ₂, δ₃, δ₄)
+    update_diagonal_rq!(R, τ_current, k̄, b, γ, δ₁, δ₂, δ₃, δ₄, r⁽¹⁾ᵀU⁽²⁾_table)
+    update_next_submatrix_rq!(R, τ_current, k̄, b, γ, δ₁, δ₂, δ₃, δ₄)
+    R.j[] += 1
 end
 
 # the following are auxiliary functions:
@@ -480,6 +639,210 @@ function fast_UᵀA(U, V, W, S, B, j)
     UᵀA
 end
 
+function compute_γ(R, b)
+    T = eltype(R)
+    j = R.j[]
+    γ = zeros(T, length(b)+1)
+    for i in 1:length(b)
+        #γ[1:i+1] += b[i]*R.B[1+j:1+i+j, 1+i+j]
+        view(γ, 1:i+1) .+= b[i]*view(R.B, 1+j:1+i+j, 1+i+j)
+        #γ[1:i] += b[i]*R.W[1+j:i+j,:]*R.S[1+i+j,:]
+        mul!(view(γ, 1:i), view(R.W,1+j:i+j,:), view(R.S,1+i+j,:), b[i], one(T))
+    end
+    γ
+end
+
+function compute_variables_δ(R, k̄, b, UᵀU)
+    j = R.j[]
+    n, r = size(R.U)
+    l,m = bandwidths(R.B)
+    #UᵀU⁽²⁾ = UᵀU[j+2, :, :]
+    UᵀU⁽²⁾ = view(UᵀU, j+2, :, :)
+
+    #δ₂ = R.S[1+j,1:r] + UᵀU⁽²⁾*k̄ + (R.S[2+j:length(b)+1+j,1:r])'*b
+    δ₂ = view(R.S, 1+j, 1:r) + UᵀU⁽²⁾*k̄ + (view(R.S, 2+j:length(b)+1+j, 1:r))'*b
+    δ₁ = R.Ω * δ₂
+
+    #Ψ_valid = R.Ψₛ[:,1:min(l,n-j)]
+    Ψ_valid = view(R.Ψₛ, :, 1:min(l,n-j))
+    #δ₃ = Ψ_valid[:,2:end]*R.S[2+j:size(Ψ_valid,2)+j,1:r]*k̄ + Ψ_valid[:,2:end]*b[1:size(Ψ_valid,2)-1]
+    δ₃ = view(Ψ_valid, :, 2:size(Ψ_valid,2))*view(R.S, 2+j:size(Ψ_valid,2)+j, 1:r)*k̄ + view(Ψ_valid, :, 2:size(Ψ_valid,2))*view(b, 1:size(Ψ_valid,2)-1)
+    if l > 0
+        #δ₃ += Ψ_valid[:,1]
+        δ₃ .+= view(Ψ_valid, :, 1)
+    end
+
+    #Λ_valid = R.Λₛ[1:min(l,n-j), 1:min(l,n-j)]
+    Λ_valid = view(R.Λₛ, 1:min(l,n-j), 1:min(l,n-j))
+    #δ₄ = Λ_valid[:,2:end]*R.S[2+j:size(Λ_valid,2)+j,1:r]*k̄ + Λ_valid[:,2:end]*b[1:size(Λ_valid,2)-1]
+    δ₄ = view(Λ_valid, :, 2:size(Λ_valid,2))*view(R.S, 2+j:size(Λ_valid,2)+j, 1:r)*k̄ + view(Λ_valid, :, 2:size(Λ_valid,2))*view(b, 1:size(Λ_valid,2)-1)
+    if l > 0
+        #δ₄ += Λ_valid[:,1]
+        δ₄ .+= view(Λ_valid, :, 1)
+    end
+
+    δ₁, δ₂, δ₃, δ₄
+end
+
+function update_lower_triangular_part_rq!(R, τ, k̄, b, γ, δ₁, δ₂, δ₃, δ₄)
+    n, r = size(R.U)
+    l,m = bandwidths(R.B)
+    T = eltype(R)
+    j = R.j[]
+    #ū₁ = R.S[j+1, 1:r]
+    ū₁ = view(R.S, j+1, 1:r)
+
+    #η = -τ*γ[2:end]
+    η = -τ*view(γ, 2:length(γ))
+    #η[1:min(length(η),size(R.Φₛ,1)-1)] += R.Φₛ[2:min(length(η)+1,size(R.Φₛ,1)),:]*ū₁ - τ*R.Φₛ[2:min(length(η)+1,size(R.Φₛ,1)),:]*δ₂
+    mul!(view(η, 1:min(length(η), size(R.Φₛ,1)-1)), view(R.Φₛ, 2:min(length(η)+1,size(R.Φₛ,1)),:), ū₁, one(T), one(T))
+    mul!(view(η, 1:min(length(η), size(R.Φₛ,1)-1)), view(R.Φₛ, 2:min(length(η)+1,size(R.Φₛ,1)),:), δ₂, -τ, one(T))
+    #η[1:length(δ₄)-1] += -τ*δ₄[2:end]
+    view(η, 1:length(δ₄)-1) .+= -τ*view(δ₄, 2:length(δ₄))
+    if l > 0
+        #η[1:min(length(η), size(R.Λₛ,1)-1)] += R.Λₛ[2:min(length(η)+1,size(R.Λₛ,1)),1]
+        view(η, 1:min(length(η), size(R.Λₛ,1)-1)) .+= view(R.Λₛ, 2:min(length(η)+1,size(R.Λₛ,1)), 1)
+    end
+
+    μ = -τ*k̄ + R.Ω*ū₁ - τ*δ₁ - τ*δ₃
+    if l > 0
+        #μ .+= R.Ψₛ[:,1]
+        μ .+= view(R.Ψₛ, :, 1)
+    end
+
+    #R.B[j+2:j+1+length(η),j+1] = η 
+    view(R.B, j+2:j+1+length(η), j+1) .= η 
+    #R.V[j+1,:] = μ
+    view(R.V, j+1, :) .= μ
+
+end
+
+function update_diagonal_rq!(R, τ, k̄, b, γ, δ₁, δ₂, δ₃, δ₄, r⁽¹⁾ᵀU⁽²⁾_table)
+    j = R.j[]
+    l,m = bandwidths(R.B)
+    n, r = size(R.U)
+    #ū₁ = R.S[j+1, 1:r]
+    ū₁ = view(R.S, j+1, 1:r)
+    #r⁽¹⁾ᵀU⁽²⁾ = (r⁽¹⁾ᵀU⁽²⁾_table[j+1, :])'
+    r⁽¹⁾ᵀU⁽²⁾ = view(r⁽¹⁾ᵀU⁽²⁾_table, j+1, :)'
+    diag_orig = R.B[j+1,j+1]
+    R.B[j+1,j+1] = R.B[j+1,j+1] - τ*R.B[j+1,j+1] - τ*r⁽¹⁾ᵀU⁽²⁾*k̄ +
+                   R.B[j+1,j+1]*(ū₁'*R.Ω*ū₁-τ*ū₁'*δ₁) + r⁽¹⁾ᵀU⁽²⁾*(R.Ω*ū₁-τ*δ₁) - 
+                   τ*R.B[j+1,j+1]*ū₁'*δ₃ - τ*r⁽¹⁾ᵀU⁽²⁾*δ₃
+    if l > 0
+        #R.B[j+1,j+1] += -τ*γ[1] + R.Φₛ[1,:]'*ū₁ + diag_orig*ū₁'*R.Ψₛ[:,1] -
+        #                τ*R.Φₛ[1,:]'*δ₂ + r⁽¹⁾ᵀU⁽²⁾*R.Ψₛ[:,1] - τ*δ₄[1] + R.Λₛ[1,1]
+        R.B[j+1,j+1] += -τ*γ[1] + view(R.Φₛ, 1, :)'*ū₁ + diag_orig*ū₁'*view(R.Ψₛ, :, 1) -
+                        τ*view(R.Φₛ, 1, :)'*δ₂ + r⁽¹⁾ᵀU⁽²⁾*view(R.Ψₛ, :, 1) - τ*δ₄[1] + R.Λₛ[1,1]
+    end
+end
+
+function update_next_submatrix_rq!(R, τ, k̄, b, γ, δ₁, δ₂, δ₃, δ₄)
+    T = eltype(R)
+
+    #R.Ω .= -τ*k̄*k̄' + R.Ω - τ*δ₁*k̄' - τ*δ₃*k̄'
+    mul!(R.Ω, k̄, k̄', -τ, one(T))
+    mul!(R.Ω, δ₁, k̄', -τ, one(T))
+    mul!(R.Ω, δ₃, k̄', -τ, one(T))
+
+    temp_Ψₛ = R.Ψₛ[:,2:end] # need to copy the original R.Ψₛ first
+    #R.Ψₛ[:,1:length(b)] = (-τ*k̄ - τ*δ₁ - τ*δ₃)*b'
+    mul!(view(R.Ψₛ, :, 1:length(b)), k̄, b', -τ, zero(T))
+    mul!(view(R.Ψₛ, :, 1:length(b)), δ₁, b', -τ, one(T))
+    mul!(view(R.Ψₛ, :, 1:length(b)), δ₃, b', -τ, one(T))
+    #R.Ψₛ[:,1:end-1] += temp_Ψₛ
+    view(R.Ψₛ, :, 1:size(R.Ψₛ,2)-1) .+= temp_Ψₛ
+    #R.Ψₛ[:,length(b)+1:end] .= 0
+    view(R.Ψₛ, :, length(b)+1:size(R.Ψₛ,2)) .= zero(T)
+
+    temp_Λₛ = R.Λₛ[2:end,2:end] # need to copy the original R.Λₛ first
+    #R.Λₛ[1:length(γ)-1,1:length(b)] = -τ*γ[2:end]*b'
+    mul!(view(R.Λₛ, 1:length(γ)-1, 1:length(b)), view(γ, 2:length(γ)), b', -τ, zero(T)) 
+    #R.Λₛ[1:size(R.Φₛ,1)-1,1:length(b)] += -τ*R.Φₛ[2:end,:]*δ₂*b'
+    mul!(view(R.Λₛ, 1:size(R.Φₛ,1)-1, 1:length(b)), view(R.Φₛ, 2:size(R.Φₛ,1), :), δ₂*b', -τ, one(T))
+    #R.Λₛ[1:size(R.Λₛ,1)-1,1:size(R.Λₛ,2)-1] += temp_Λₛ
+    view(R.Λₛ, 1:size(R.Λₛ,1)-1, 1:size(R.Λₛ,2)-1) .+= temp_Λₛ
+    #R.Λₛ[1:length(δ₄)-1,1:length(b)] += -τ*δ₄[2:end]*b'
+    mul!(view(R.Λₛ, 1:length(δ₄)-1, 1:length(b)), view(δ₄, 2:length(δ₄)), b', -τ, one(T))
+    #R.Λₛ[length(γ):end,:] .= 0
+    view(R.Λₛ, length(γ):size(R.Λₛ,1), :) .= zero(T)
+    #R.Λₛ[:,length(b)+1:end] .= 0
+    view(R.Λₛ, :,length(b)+1:size(R.Λₛ,2)) .= zero(T)
+
+    #temp_Φₛ = R.Φₛ[2:end,:] - τ*R.Φₛ[2:end,:]*δ₂*k̄'
+    temp_Φₛ = -τ*view(R.Φₛ, 2:size(R.Φₛ,1), :)*δ₂*k̄'
+    temp_Φₛ .+= view(R.Φₛ, 2:size(R.Φₛ,1), :)
+    #R.Φₛ[1:length(γ)-1,:] = -τ*γ[2:end]*k̄'
+    mul!(view(R.Φₛ, 1:length(γ)-1, :), view(γ, 2:length(γ)), k̄', -τ, zero(T))
+    #R.Φₛ[1:end-1,:] += temp_Φₛ
+    view(R.Φₛ, 1:size(R.Φₛ,1)-1, :) .+= temp_Φₛ
+    #R.Φₛ[1:length(δ₄)-1,:] += -τ*δ₄[2:end]*k̄'
+    mul!(view(R.Φₛ, 1:length(δ₄)-1, :), view(δ₄, 2:length(δ₄)), k̄', -τ, one(T))
+    #R.Φₛ[length(γ):end,1] .= 0
+    view(R.Φₛ, length(γ):size(R.Φₛ,1), 1) .= zero(T)
+
+end
+
+function UᵀU_lookup_table_rq(R)
+    n, r = size(R.U)
+    T = eltype(R)
+    UᵀU = zeros(T, n, r, r)
+    UᵀU_current = zeros(T, r, r)
+    for i in n:-1:1
+        #UᵀU_current += R.S[i,1:r] * (R.S[i,1:r])'
+        mul!(UᵀU_current, view(R.S, i, 1:r), view(R.S, i, 1:r)', one(T), one(T))
+        #UᵀU[i,:,:] .= UᵀU_current
+        view(UᵀU, i, :, :) .= UᵀU_current
+    end
+    UᵀU
+end
+
+function r⁽¹⁾ᵀU⁽²⁾_lookup_table(R)
+    # R₀ = Matrix(triu(R.B) + triu(R.W*R.S', 1)) and r⁽¹⁾ᵀU⁽²⁾ = R₀[j+1,j+2:end]'*R.S[j+2:end,1:r]
+    n, r = size(R.U)
+    l, m = bandwidths(R.B)
+    T = eltype(R)
+    r⁽¹⁾ᵀU⁽²⁾ = zeros(T, n, r)
+    #SᵀU = R.S' * R.S[:, 1:r]
+    SᵀU = R.S' * view(R.S, :, 1:r)
+    for i in 1:n-1
+        #SᵀU -= R.S[i,:] * R.S[i,1:r]'
+        mul!(SᵀU, view(R.S, i, :), view(R.S, i, 1:r)', -one(T), one(T))
+        #r⁽¹⁾ᵀU⁽²⁾[i, :] = (R.W[i,:]' * SᵀU + R.B[i, i+1:min(i+m,n)]'*R.S[i+1:min(i+m,n),1:r])'
+        mul!(view(r⁽¹⁾ᵀU⁽²⁾, i, :), SᵀU', view(R.W, i, :), one(T), zero(T))
+        mul!(view(r⁽¹⁾ᵀU⁽²⁾, i, :), view(R.S, i+1:min(i+m,n),1:r)', view(R.B, i, i+1:min(i+m,n)), one(T), one(T)) 
+    end
+    r⁽¹⁾ᵀU⁽²⁾
+end
+
+function fast_RU(U, W, S, B, j)
+    # compute R[j:end,j:end*U[j,end] where R = triu(B) + triu(WS',1) in O(n)
+    n, r = size(U)
+    p = size(W,2)
+    l, m = bandwidths(B)
+    T = eltype(U)
+    RU = zeros(T, n+1-j, r)
+    #SᵀU = S[j:n, :]' * S[j:n, 1:r]
+    SᵀU = view(S, j:n, :)' * view(S, j:n, 1:r)
+    for i in j:n
+        #SᵀU -= S[i,:] * S[i,1:r]'
+        mul!(SᵀU, view(S, i, :), view(S, i, 1:r)', -one(T), one(T))
+        #RU[i+1-j,:] = (W[i,:]'*SᵀU + B[i,i:min(i+m,n)]'*S[i:min(i+m,n),1:r])'
+        mul!(view(RU, i+1-j, :), SᵀU', view(W, i, :), one(T), zero(T))
+        mul!(view(RU, i+1-j, :), view(S, i:min(i+m,n), 1:r)', view(B, i, i:min(i+m,n)), one(T), one(T))
+    end
+    RU
+end
+
+function symmetrize_from_lower!(B::BandedMatrix{T}) where T
+    n = size(B,1)
+    l, m = bandwidths(B)
+    for i in 1:n
+        for j in 1:min(m,n-i)
+            B[i,i+j] = B[i+j,i]
+        end
+    end
+end
 
 
 ###
