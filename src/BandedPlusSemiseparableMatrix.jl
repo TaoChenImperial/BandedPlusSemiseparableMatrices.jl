@@ -18,6 +18,28 @@ end
 size(A::BandedPlusSemiseparableMatrix) = size(A.B)
 copy(A::BandedPlusSemiseparableMatrix) = A # not mutable
 
+function mul(A::BandedPlusSemiseparableMatrix, b::StridedVector)
+    n, r = size(A.U)
+    l, m = bandwidths(A.B)
+    T = eltype(A.U)
+    res = zeros(T, n)
+    Sᵀb = A.S' * b
+    Vᵀb = zeros(T, r)
+    for k in 1 : n
+        Bb = 0
+        for j in max(1, k - l) : min(n, k + m)
+            Bb += A.B[k, j] * b[j]
+        end
+        #Sᵀb -= A.S[k, :] * b[k]
+        Sᵀb -= view(A.S, k, :) * b[k]
+        #res[k] = A.U[k, :]' * Vᵀb + Bb + A.W[k, :]' * Sᵀb
+        res[k] = view(A.U, k, :)' * Vᵀb + Bb + view(A.W, k, :)' * Sᵀb
+        #Vᵀb += A.V[k, :] * b[k]
+        Vᵀb += view(A.V, k, :) * b[k]
+    end
+    res
+end
+
 function getindex(A::BandedPlusSemiseparableMatrix, k::Integer, j::Integer)
     if j > k
         view(A.W, k, :)' * view(A.S, j, :) + A.B[k,j]

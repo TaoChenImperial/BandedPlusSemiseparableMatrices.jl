@@ -204,9 +204,7 @@ function SymmetricBPSPerturbedRQ(B, (U,V), (W,S))
         if m < l
             throw(ErrorException("The upper bandwidth of B should be no less than the lower bandwidth"))
         end
-        R = Matrix(triu(B) + triu(W*S',1))
-        # to be modified
-        U_new = R*U
+        U_new = fast_RU(U, W, S, B, 1)
         SymmetricBPSPerturbedRQ(B,U_new,V,W,S,zeros(r,r),zeros(min(l,n),r),zeros(r,min(l,n)),zeros(min(l,n),min(l,n)),Ref(0))
     else
         throw(DimensionMismatch("Dimensions are not compatible."))
@@ -276,8 +274,10 @@ function rq_mul!(R::SymmetricBPSPerturbedRQ{T}, τ::Vector{T}) where T
     end
     
     n = size(R, 1)
+    UᵀU = UᵀU_lookup_table_rq(R)
+    r⁽¹⁾ᵀU⁽²⁾ = r⁽¹⁾ᵀU⁽²⁾_lookup_table(R)
     for i in 1 : n-1
-        onestep_rq!(R, τ, UᵀU_lookup_table_rq(R), r⁽¹⁾ᵀU⁽²⁾_lookup_table(R))
+        onestep_rq!(R, τ, UᵀU, r⁽¹⁾ᵀU⁽²⁾)
     end
 
     R.B[n,n] = R[n,n] 
