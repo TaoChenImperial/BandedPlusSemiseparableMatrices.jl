@@ -1,4 +1,6 @@
-using SemiseparableMatrices, LazyArrays, MatrixFactorizations, Test
+using SemiseparableMatrices, BandedMatrices, LazyArrays, MatrixFactorizations, LinearAlgebra, Test
+import SemiseparableMatrices: GivensWeightMatrix
+
 
 @testset "Inverse of banded" begin
     @testset "Bidiagonal" begin
@@ -66,6 +68,49 @@ using SemiseparableMatrices, LazyArrays, MatrixFactorizations, Test
             c̃ = a .* cumsum(b .* c)
             @test tril(a*b̃') ≈ tril(Ai)
             @test triu(c̃*d') ≈ triu(Ai)
+        end
+    end
+
+    @testset "Givens-weight inverse of upper banded" begin
+        @testset "n = $n, m = $m" for n in (1, 10, 100, 200), m in (1, 2, 4, 8)
+            B = brand(n, n, 0, m)
+            B[band(0)] .+= m + 1
+            @test GivensWeightMatrix(ApplyArray(inv, B)) ≈ inv(Matrix(B))
+        end
+
+        @testset "Toeplitz" begin
+            for n = 10 .^ (1:3)
+                U = Bidiagonal(fill(1,n), fill(1/2, n-1), :U)
+                @test inv(U) ≈ SemiseparableMatrix(ApplyArray(inv, U)) ≈ GivensWeightMatrix(ApplyArray(inv, BandedMatrix(U)))
+            end
+            # let n = 5000
+            #     U = Bidiagonal(fill(1,n), fill(-1/2, n-1), :U)
+            #     @test inv(U) ≈ GivensWeightMatrix(ApplyArray(inv, BandedMatrix(U)))
+            # end
+        end
+
+        @testset "Matrix and broadcasting" begin
+            n = 50
+            B = brand(n, n, 0, 2)
+            B[band(0)] .+= 3
+            X = GivensWeightMatrix(ApplyArray(inv, B))
+            Xd = inv(Matrix(B))
+            @test Matrix(X) isa Matrix{Float64}
+            @test Matrix(X) ≈ Xd
+            A = randn(n, n)
+            for M in (A, UpperTriangular(A), LowerTriangular(A), Diagonal(randn(n)), brand(n, n, 1, 1))
+                @test M - X ≈ M - Xd
+                @test X - M ≈ Xd - M
+                @test M + X ≈ M + Xd
+                @test M .* X ≈ M .* Xd
+            end
+            @test UpperTriangular(A) - X isa Matrix
+            @test 2X ≈ X .* 2 ≈ 2Xd
+            @test X + X ≈ 2Xd
+            @test -X ≈ -Xd
+            dest = zeros(n, n)
+            dest .= UpperTriangular(A) .- X
+            @test dest ≈ UpperTriangular(A) - Xd
         end
     end
 end

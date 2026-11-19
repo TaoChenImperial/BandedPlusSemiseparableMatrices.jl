@@ -44,6 +44,56 @@ function getindex(X::GivensWeightMatrix{T}, i::Int, j::Int) where T
     X.c[1,j] * u[1]
 end
 
+# Fill row-by-row, propagating u = w_iᵀ S_i ⋯ S_{j-1} in place across j: O(n² m) total
+# with O(m) workspace, instead of O(n m) per entry via getindex.
+function copyto!(dest::StridedMatrix, X::GivensWeightMatrix{T}) where T
+    size(dest) == size(X) || throw(DimensionMismatch("size of destination $(size(dest)) does not match $(size(X))"))
+    n = size(X,1)
+    m = size(X.w,1)
+    c, s, w = X.c, X.s, X.w
+    u = zeros(T, m+1)
+    for i = 1:n
+        for p = 1:m
+            u[p] = w[p,i]
+        end
+        u[m+1] = zero(T)
+        for j = 1:i-1
+            dest[i,j] = zero(T)
+        end
+        for j = i:n
+            dest[i,j] = c[1,j] * u[1]
+            j == n && break
+            for p = 1:m # [uᵀ 0] G_j = [uᵀc_j  uᵀS_j]
+                up, um = u[p], u[m+1]
+                u[p], u[m+1] = c[p,j]*up - s[p,j]*um, s[p,j]*up + c[p,j]*um
+            end
+            for p = 1:m # shift: keep uᵀS_j
+                u[p] = u[p+1]
+            end
+            u[m+1] = zero(T)
+        end
+    end
+    dest
+end
+
+Base.Matrix{T}(X::GivensWeightMatrix) where T = copyto!(Matrix{T}(undef, size(X)...), X)
+Base.Matrix(X::GivensWeightMatrix{T}) where T = Matrix{T}(X)
+Base.Array(X::GivensWeightMatrix) = Matrix(X)
+
+# Broadcasting: densify any GivensWeightMatrix arguments via the fast copyto! (rather than
+# entrywise getindex) and re-broadcast. This also covers A ± X for any AbstractMatrix A,
+# since +/- on arrays lower to broadcast.
+struct GivensWeightStyle <: Broadcast.AbstractArrayStyle{2} end
+GivensWeightStyle(::Val{2}) = GivensWeightStyle()
+GivensWeightStyle(::Val{N}) where N = Broadcast.DefaultArrayStyle{N}()
+Broadcast.BroadcastStyle(::Type{<:GivensWeightMatrix}) = GivensWeightStyle()
+Broadcast.BroadcastStyle(::GivensWeightStyle, ::Broadcast.AbstractArrayStyle{2}) = GivensWeightStyle()
+Broadcast.BroadcastStyle(::GivensWeightStyle, ::Broadcast.DefaultArrayStyle{2}) = GivensWeightStyle()
+
+_givensweight_densify(X::GivensWeightMatrix) = Matrix(X)
+_givensweight_densify(x) = x
+Broadcast.broadcasted(::GivensWeightStyle, f, args...) = Broadcast.broadcasted(f, map(_givensweight_densify, args)...)
+
 # O(n m²) construction, bottom-up. T_{i+1} is the upper triangular m × m factor of the
 # Gram matrix of rows i+1:i+m of inv(B ⊕ I_m) (so T_{n+1} = I), and
 # M_i = [e_1/d_i | L_i T_{i+1}] with L_i the companion matrix of row i of B.
